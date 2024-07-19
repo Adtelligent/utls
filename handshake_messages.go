@@ -99,6 +99,11 @@ type clientHelloMsg struct {
 
 	// [uTLS]
 	nextProtoNeg bool
+
+	// [adt]
+	customExtToDelete map[uint16]struct{}
+	customExtToStore  map[uint16]struct{}
+	customExtData     map[uint16][]byte
 }
 
 func (m *clientHelloMsg) marshal() ([]byte, error) {
@@ -371,7 +376,11 @@ func (m *clientHelloMsg) updateBinders(pskBinders [][]byte) error {
 }
 
 func (m *clientHelloMsg) unmarshal(data []byte) bool {
-	*m = clientHelloMsg{raw: data}
+	*m = clientHelloMsg{raw: data, customExtToStore: m.customExtToStore, customExtToDelete: m.customExtToDelete}
+	if len(m.customExtToStore) > 0 {
+		m.customExtData = make(map[uint16][]byte)
+	}
+
 	s := cryptobyte.String(data)
 
 	if !s.Skip(4) || // message type and uint24 length field
@@ -411,6 +420,9 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 		return false
 	}
 
+	extStartPos := len(m.raw) - len(extensions)
+	var extLen int
+
 	seenExts := make(map[uint16]bool)
 	for !extensions.Empty() {
 		var extension uint16
@@ -424,6 +436,9 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			return false
 		}
 		seenExts[extension] = true
+
+		extStartPos += extLen
+		extLen = 4 + len(extData)
 
 		switch extension {
 		case extensionServerName:
@@ -617,8 +632,20 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 				m.pskBinders = append(m.pskBinders, binder)
 			}
 		default:
-			// Ignore unknown extensions.
-			continue
+			if _, ok := m.customExtToDelete[extension]; ok {
+				m.raw = append(m.raw[:extStartPos], m.raw[extStartPos+extLen:]...)
+
+				extLen = 0
+			}
+
+			if _, ok := m.customExtToStore[extension]; !ok {
+				continue
+			}
+
+			m.customExtData[extension] = make([]byte, len(extData))
+			if !extData.CopyBytes(m.customExtData[extension]) {
+				return false
+			}
 		}
 
 		if !extData.Empty() {
