@@ -375,15 +375,24 @@ func (m *clientHelloMsg) updateBinders(pskBinders [][]byte) error {
 	return nil
 }
 
+func putUint24(b []byte, v uint32) {
+	_ = b[2] // early bounds check to guarantee safety of writes below
+	b[0] = byte(v >> 16)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v)
+}
+
 func (m *clientHelloMsg) unmarshal(data []byte) bool {
 	*m = clientHelloMsg{raw: data, customExtToStore: m.customExtToStore, customExtToDelete: m.customExtToDelete}
 	if len(m.customExtToStore) > 0 {
 		m.customExtData = make(map[uint16][]byte)
 	}
 
+	var msgLen uint32
+
 	s := cryptobyte.String(data)
 
-	if !s.Skip(4) || // message type and uint24 length field
+	if !s.Skip(1) || !s.ReadUint24(&msgLen) || // message type and uint24 length field
 		!s.ReadUint16(&m.vers) || !s.ReadBytes(&m.random, 32) ||
 		!readUint8LengthPrefixed(&s, &m.sessionId) {
 		return false
@@ -415,13 +424,22 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 		return true
 	}
 
+	if len(s) < 2 {
+		return false
+	}
+
+	allExtLen := uint16(s[1]) | uint16(s[0])<<8
+
 	var extensions cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&extensions) || !s.Empty() {
 		return false
 	}
 
 	extStartPos := len(m.raw) - len(extensions)
+	allExtLenPos := extStartPos - 2
 	var extLen int
+
+	var gotPreSharedKey, gotExtAfterPresharedKey bool
 
 	seenExts := make(map[uint16]bool)
 	for !extensions.Empty() {
@@ -439,6 +457,13 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 
 		extStartPos += extLen
 		extLen = 4 + len(extData)
+
+		if gotPreSharedKey {
+			if gotExtAfterPresharedKey {
+				return false
+			}
+			gotExtAfterPresharedKey = true
+		}
 
 		switch extension {
 		case extensionServerName:
@@ -603,9 +628,11 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			}
 		case extensionPreSharedKey:
 			// RFC 8446, Section 4.2.11
-			if !extensions.Empty() {
-				return false // pre_shared_key must be the last extension
-			}
+			//if !extensions.Empty() { // moved below due to custom exts
+			//	return false // pre_shared_key must be the last extension
+			//}
+			gotPreSharedKey = true
+
 			var identities cryptobyte.String
 			if !extData.ReadUint16LengthPrefixed(&identities) || identities.Empty() {
 				return false
@@ -635,6 +662,11 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			if _, ok := m.customExtToDelete[extension]; ok {
 				m.raw = append(m.raw[:extStartPos], m.raw[extStartPos+extLen:]...)
 
+				msgLen = msgLen - uint32(extLen)
+				allExtLen = allExtLen - uint16(extLen)
+
+				gotExtAfterPresharedKey = false
+
 				extLen = 0
 			}
 
@@ -652,6 +684,10 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			return false
 		}
 	}
+
+	putUint24(m.raw[1:4], msgLen)
+	m.raw[allExtLenPos] = byte(allExtLen >> 8)
+	m.raw[allExtLenPos+1] = byte(allExtLen)
 
 	return true
 }
